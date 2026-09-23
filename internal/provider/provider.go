@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"net/http"
 	"os"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -10,7 +11,20 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	lksdk "github.com/livekit/server-sdk-go/v2"
+	"github.com/twitchtv/twirp"
 )
+
+// cliVersionHeaderOption sets the X-LIVEKIT-CLI-VERSION header on every CloudAgent
+// request. The API rejects requests missing it with a malformed-request error,
+// regardless of caller.
+func cliVersionHeaderOption() lksdk.AgentClientOption {
+	return lksdk.WithTwirpClientOptions(twirp.WithClientHooks(&twirp.ClientHooks{
+		RequestPrepared: func(ctx context.Context, r *http.Request) (context.Context, error) {
+			r.Header.Set("X-LIVEKIT-CLI-VERSION", lksdk.Version)
+			return ctx, nil
+		},
+	}))
+}
 
 var _ provider.Provider = &livekitProvider{}
 
@@ -111,7 +125,7 @@ func (p *livekitProvider) Configure(ctx context.Context, req provider.ConfigureR
 		return
 	}
 
-	agentClient, err := lksdk.NewAgentClient(url, apiKey, apiSecret, lksdk.WithHTTPClient(newRetryableClient()))
+	agentClient, err := lksdk.NewAgentClient(url, apiKey, apiSecret, lksdk.WithHTTPClient(newRetryableClient()), cliVersionHeaderOption())
 	if err != nil {
 		resp.Diagnostics.AddError("Configuration Error", "Unable to create LiveKit agent client: "+err.Error())
 		return

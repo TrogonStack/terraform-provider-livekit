@@ -50,8 +50,8 @@ func (r *agentSecretResource) Schema(_ context.Context, _ resource.SchemaRequest
 
 The secret value is a write-only argument (` + "`value_wo`" + `) and never lands in Terraform
 state. Pair it with ` + "`value_wo_version`" + `: changing the version is what tells the
-provider to send a new value. Changing ` + "`kind`" + `, ` + "`agent_id`" + `, or
-` + "`name`" + ` replaces the resource.
+provider to send a new value. Changing ` + "`kind`" + ` updates the secret in place.
+Changing ` + "`agent_id`" + ` or ` + "`name`" + ` replaces the resource.
 
 The value is not importable. After ` + "`terraform import`" + `, set ` + "`value_wo`" + ` and
 ` + "`value_wo_version`" + ` in configuration and apply to synchronize it.`,
@@ -69,11 +69,10 @@ The value is not importable. After ` + "`terraform import`" + `, set ` + "`value
 				Optional:            true,
 				Computed:            true,
 				Default:             stringdefault.StaticString(string(secretKindEnvironment)),
-				MarkdownDescription: "One of `environment` or `file`. Defaults to `environment`.",
+				MarkdownDescription: "One of `environment` or `file`. Defaults to `environment`. Changing it updates the secret in place.",
 				Validators: []validator.String{
 					stringvalidator.OneOf(string(secretKindEnvironment), string(secretKindFile)),
 				},
-				PlanModifiers: replace,
 			},
 			"value_wo": schema.StringAttribute{
 				Required:            true,

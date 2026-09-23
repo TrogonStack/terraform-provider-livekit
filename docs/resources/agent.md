@@ -26,7 +26,7 @@ resource "livekit_agent" "voice_assistant" {
 
 ### Optional
 
-- `regions` (Set of String) The regions the agent is deployed to. Leave unset to let LiveKit Cloud pick a default region. Until the agent has a deployment, the configured value is kept as is.
+- `regions` (Set of String) The regions the agent is deployed to. Leave unset to let LiveKit Cloud pick a default region. LiveKit Cloud currently accepts a single region when creating an agent. A region change on an existing agent takes effect once the agent is next built and deployed.
 
 ### Read-Only
 

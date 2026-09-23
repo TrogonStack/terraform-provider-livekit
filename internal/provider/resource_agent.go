@@ -6,7 +6,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -59,7 +58,8 @@ func (r *agentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Computed:    true,
 				ElementType: types.StringType,
 				MarkdownDescription: "The regions the agent is deployed to. Leave unset to let LiveKit Cloud pick a " +
-					"default region. Until the agent has a deployment, the configured value is kept as is.",
+					"default region. LiveKit Cloud currently accepts a single region when creating an agent. A " +
+					"region change on an existing agent takes effect once the agent is next built and deployed.",
 				PlanModifiers: []planmodifier.Set{
 					setplanmodifier.UseStateForUnknown(),
 				},
@@ -190,7 +190,7 @@ func (r *agentResource) Update(ctx context.Context, req resource.UpdateRequest, 
 		return
 	}
 
-	resp.Diagnostics.Append(applyAgentInfo(ctx, &plan, info)...)
+	applyAgentMetadata(&plan, info)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -237,8 +237,11 @@ func (r *agentResource) findAgent(ctx context.Context, id string) (*livekit.Agen
 }
 
 func applyAgentInfo(ctx context.Context, model *agentResourceModel, info *livekit.AgentInfo) diag.Diagnostics {
-	var diags diag.Diagnostics
+	applyAgentMetadata(model, info)
+	return applyAgentRegions(ctx, model, info)
+}
 
+func applyAgentMetadata(model *agentResourceModel, info *livekit.AgentInfo) {
 	model.AgentName = types.StringValue(info.AgentName)
 	model.Version = types.StringValue(info.Version)
 	if info.DeployedAt != nil {
@@ -246,6 +249,10 @@ func applyAgentInfo(ctx context.Context, model *agentResourceModel, info *liveki
 	} else {
 		model.DeployedAt = types.StringNull()
 	}
+}
+
+func applyAgentRegions(ctx context.Context, model *agentResourceModel, info *livekit.AgentInfo) diag.Diagnostics {
+	var diags diag.Diagnostics
 
 	regionSet := make(map[string]struct{}, len(info.AgentDeployments))
 	for _, d := range info.AgentDeployments {
@@ -259,14 +266,13 @@ func applyAgentInfo(ctx context.Context, model *agentResourceModel, info *liveki
 	}
 	sort.Strings(regions)
 
-	switch {
-	case len(regions) > 0:
-		set, d := types.SetValueFrom(ctx, types.StringType, regions)
-		diags.Append(d...)
-		model.Regions = set
-	case model.Regions.IsUnknown():
-		model.Regions = types.SetValueMust(types.StringType, []attr.Value{})
+	if !model.Regions.IsNull() && !model.Regions.IsUnknown() {
+		return diags
 	}
+
+	set, d := types.SetValueFrom(ctx, types.StringType, regions)
+	diags.Append(d...)
+	model.Regions = set
 
 	return diags
 }

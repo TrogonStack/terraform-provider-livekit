@@ -18,7 +18,13 @@ run = "golangci-lint run --fix ./..."
 
 [tasks.test]
 description = "run unit tests"
-run = "go test -count=1 -cover ./..."
+run = "go test -count=1 -cover -skip TestLive ./..."
+env = { TF_ACC = "1" }
+
+[tasks."test:live"]
+description = "run live acceptance tests against a real LiveKit Cloud project"
+run = "go test ./internal/provider -run TestLive -v -count=1 -timeout 30m"
+env = { TF_ACC = "1" }
 
 [tasks.tidy]
 description = "tidy Go modules"

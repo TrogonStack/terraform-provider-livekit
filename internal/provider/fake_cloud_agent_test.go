@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 
 	"github.com/livekit/protocol/livekit"
@@ -10,6 +11,24 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func requireCLIVersionHeader(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-LIVEKIT-CLI-VERSION") == "" {
+			_ = twirp.WriteError(w, twirp.NewError(twirp.Malformed, "livekit-cli version header is required"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func errAgentNotFound() error {
+	return twirp.NewError(twirp.Internal, "failed to get agent")
+}
+
+func errDeleteAgentNotFound() error {
+	return twirp.NewError(twirp.Internal, "The agent could not be found. Please check the agent ID and try again.")
+}
 
 type fakeCloudAgent struct {
 	mu             sync.Mutex
@@ -115,6 +134,10 @@ func (f *fakeCloudAgent) DeleteAgent(_ context.Context, req *livekit.DeleteAgent
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if _, ok := f.agents[req.AgentId]; !ok {
+		return nil, errDeleteAgentNotFound()
+	}
+
 	delete(f.agents, req.AgentId)
 	delete(f.regions, req.AgentId)
 	delete(f.secrets, req.AgentId)
@@ -125,6 +148,10 @@ func (f *fakeCloudAgent) DeleteAgent(_ context.Context, req *livekit.DeleteAgent
 func (f *fakeCloudAgent) ListAgentSecrets(_ context.Context, req *livekit.ListAgentSecretsRequest) (*livekit.ListAgentSecretsResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if _, ok := f.agents[req.AgentId]; !ok {
+		return nil, errAgentNotFound()
+	}
 
 	secrets := f.secrets[req.AgentId]
 	out := make([]*livekit.AgentSecret, 0, len(secrets))
@@ -142,6 +169,10 @@ func (f *fakeCloudAgent) ListAgentSecrets(_ context.Context, req *livekit.ListAg
 func (f *fakeCloudAgent) UpdateAgentSecrets(_ context.Context, req *livekit.UpdateAgentSecretsRequest) (*livekit.UpdateAgentSecretsResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if _, ok := f.agents[req.AgentId]; !ok {
+		return nil, errAgentNotFound()
+	}
 
 	secrets, ok := f.secrets[req.AgentId]
 	if !ok || req.Overwrite {

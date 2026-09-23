@@ -6,8 +6,8 @@ description: |-
   Manages a secret deployed to a LiveKit Cloud agent.
   The secret value is a write-only argument (value_wo) and never lands in Terraform
   state. Pair it with value_wo_version: changing the version is what tells the
-  provider to send a new value. Changing kind, agent_id, or
-  name replaces the resource.
+  provider to send a new value. Changing kind updates the secret in place.
+  Changing agent_id or name replaces the resource.
   The value is not importable. After terraform import, set value_wo and
   value_wo_version in configuration and apply to synchronize it.
 ---
@@ -18,8 +18,8 @@ Manages a secret deployed to a LiveKit Cloud agent.
 
 The secret value is a write-only argument (`value_wo`) and never lands in Terraform
 state. Pair it with `value_wo_version`: changing the version is what tells the
-provider to send a new value. Changing `kind`, `agent_id`, or
-`name` replaces the resource.
+provider to send a new value. Changing `kind` updates the secret in place.
+Changing `agent_id` or `name` replaces the resource.
 
 The value is not importable. After `terraform import`, set `value_wo` and
 `value_wo_version` in configuration and apply to synchronize it.
@@ -49,7 +49,7 @@ resource "livekit_agent_secret" "openai_key" {
 
 ### Optional
 
-- `kind` (String) One of `environment` or `file`. Defaults to `environment`.
+- `kind` (String) One of `environment` or `file`. Defaults to `environment`. Changing it updates the secret in place.
 
 ### Read-Only
 
