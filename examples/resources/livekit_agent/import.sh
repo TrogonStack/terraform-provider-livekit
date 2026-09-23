@@ -1,0 +1,1 @@
+terraform import livekit_agent.voice_assistant CA_xxxxxxxxxxxx
