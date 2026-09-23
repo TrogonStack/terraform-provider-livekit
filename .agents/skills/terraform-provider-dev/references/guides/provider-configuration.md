@@ -4,8 +4,8 @@
 
 The provider is the top-level component that:
 
-1. Defines its own configuration schema (auth credentials, project settings)
-2. Creates API clients during Configure
+1. Defines its own configuration schema (auth credentials, project URL)
+2. Creates the API client during Configure
 3. Passes client data to resources and data sources
 4. Registers all available resources and data sources
 
@@ -26,28 +26,35 @@ type Provider interface {
 ### Metadata
 
 ```go
-func (p *googleworkspaceProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
-    resp.TypeName = "googleworkspace"
+func (p *livekitProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
+    resp.TypeName = "livekit"
     resp.Version = p.version
 }
 ```
 
-`TypeName` becomes the prefix for all resource names (`googleworkspace_drive`, `googleworkspace_user`, etc.).
+`TypeName` becomes the prefix for all resource names (`livekit_agent`, `livekit_agent_secret`).
 
 ### Schema
 
-Provider schema defines what goes in the `provider "googleworkspace" {}` block:
+Provider schema defines what goes in the `provider "livekit" {}` block:
 
 ```go
-func (p *googleworkspaceProvider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
+func (p *livekitProvider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
     resp.Schema = schema.Schema{
         Attributes: map[string]schema.Attribute{
-            "access_token":            schema.StringAttribute{Optional: true, Sensitive: true},
-            "service_account":         schema.StringAttribute{Optional: true},
-            "impersonated_user_email": schema.StringAttribute{Optional: true},
-            "customer_id":             schema.StringAttribute{Optional: true},
-            "oauth_scopes":            schema.ListAttribute{Optional: true, ElementType: types.StringType},
-            "retry_on":               schema.ListAttribute{Optional: true, ElementType: types.Int64Type},
+            "url": schema.StringAttribute{
+                Optional:            true,
+                MarkdownDescription: "The URL of the LiveKit Cloud project, e.g. `https://my-project.livekit.cloud`.",
+            },
+            "api_key": schema.StringAttribute{
+                Optional:            true,
+                MarkdownDescription: "The LiveKit API key.",
+            },
+            "api_secret": schema.StringAttribute{
+                Optional:            true,
+                Sensitive:           true,
+                MarkdownDescription: "The LiveKit API secret.",
+            },
         },
     }
 }
@@ -58,20 +65,37 @@ func (p *googleworkspaceProvider) Schema(ctx context.Context, req provider.Schem
 Configure creates the API client and makes it available to resources:
 
 ```go
-func (p *googleworkspaceProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
-    var data googleworkspaceProviderModel
+func (p *livekitProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
+    var data livekitProviderModel
     resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
     if resp.Diagnostics.HasError() {
         return
     }
 
-    // Build client...
-    client := &apiClient{
-        client:     httpClient,
-        customerID: customerID,
+    if testAPIClient != nil {
+        resp.DataSourceData = testAPIClient
+        resp.ResourceData = testAPIClient
+        return
     }
 
-    // Make client available to resources and data sources
+    url := data.URL.ValueString()
+    if url == "" {
+        url = os.Getenv("LIVEKIT_URL")
+    }
+    if url == "" {
+        resp.Diagnostics.AddError("Configuration Error", "url must be set, either in the provider configuration or the LIVEKIT_URL environment variable")
+        return
+    }
+
+    // apiKey, apiSecret resolved the same way from LIVEKIT_API_KEY / LIVEKIT_API_SECRET...
+
+    agentClient, err := lksdk.NewAgentClient(url, apiKey, apiSecret, lksdk.WithHTTPClient(newRetryableClient()))
+    if err != nil {
+        resp.Diagnostics.AddError("Configuration Error", "Unable to create LiveKit agent client: "+err.Error())
+        return
+    }
+
+    client := &apiClient{agent: agentClient}
     resp.DataSourceData = client
     resp.ResourceData = client
 }
@@ -80,23 +104,15 @@ func (p *googleworkspaceProvider) Configure(ctx context.Context, req provider.Co
 ### Resource/DataSource Registration
 
 ```go
-func (p *googleworkspaceProvider) Resources(ctx context.Context) []func() resource.Resource {
+func (p *livekitProvider) Resources(ctx context.Context) []func() resource.Resource {
     return []func() resource.Resource{
-        newDrive,
-        newDrivePermission,
-        newOrgUnit,
-        newGroup,
-        newGroupMembers,
-        newGroupSettings,
-        newRoleAssignment,
-        newUser,
+        newAgent,
+        newAgentSecret,
     }
 }
 
-func (p *googleworkspaceProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
-    return []func() datasource.DataSource{
-        newRoleDataSource,
-    }
+func (p *livekitProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
+    return []func() datasource.DataSource{}
 }
 ```
 
@@ -104,34 +120,49 @@ func (p *googleworkspaceProvider) DataSources(ctx context.Context) []func() data
 
 ```
 provider.Configure()
-    → resp.ResourceData = client
-    → resp.DataSourceData = client
+    -> resp.ResourceData = client
+    -> resp.DataSourceData = client
 
 resource.Configure()
-    → req.ProviderData == client (same pointer)
-    → r.client = req.ProviderData.(*apiClient)
+    -> req.ProviderData == client (same pointer)
+    -> r.client = req.ProviderData.(*apiClient)
 
 resource.Create/Read/Update/Delete()
-    → r.client.NewDriveService(ctx)
-    → r.client.NewDirectoryService(ctx)
+    -> r.client.agent.CreateAgentV2(ctx, ...)
+    -> r.client.agent.ListAgents(ctx, ...)
+    -> r.client.agent.UpdateAgentSecrets(ctx, ...)
 ```
+
+`*apiClient` is a one-field struct (`client.go`):
+
+```go
+type apiClient struct {
+    agent *lksdk.AgentClient
+}
+```
+
+`lksdk.AgentClient` (from `github.com/livekit/server-sdk-go/v2`) signs an agent-admin JWT from `api_key`/`api_secret` and dials the CloudAgent Twirp service at `url`.
 
 ## Environment Variable Fallbacks
 
 Provider config values can fall back to environment variables:
 
 ```go
-serviceAccount := data.ServiceAccount.ValueString()
-if serviceAccount == "" {
-    serviceAccount = os.Getenv("SERVICE_ACCOUNT")
+apiKey := data.APIKey.ValueString()
+if apiKey == "" {
+    apiKey = os.Getenv("LIVEKIT_API_KEY")
 }
 ```
 
 This provider supports:
 
-- `SERVICE_ACCOUNT` — service account email
-- `SUBJECT` — impersonated user email
-- `GOOGLEWORKSPACE_CUSTOMER_ID` — customer ID
+| Attribute    | Environment variable |
+| -------------- | ----------------------- |
+| `url`        | `LIVEKIT_URL`         |
+| `api_key`    | `LIVEKIT_API_KEY`     |
+| `api_secret` | `LIVEKIT_API_SECRET`  |
+
+The provider adds an error diagnostic if a value is missing from both configuration and environment.
 
 ## Test Bypass
 
@@ -140,7 +171,7 @@ Tests inject a mock client via the package-level `testAPIClient` variable:
 ```go
 var testAPIClient *apiClient
 
-func (p *googleworkspaceProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
+func (p *livekitProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
     // ...
     if testAPIClient != nil {
         resp.DataSourceData = testAPIClient
@@ -151,6 +182,8 @@ func (p *googleworkspaceProvider) Configure(ctx context.Context, req provider.Co
 }
 ```
 
+`setupTestClient` in `provider_test.go` is what actually sets `testAPIClient`, pointed at an `httptest.Server` serving a fake `CloudAgent` implementation (see `references/guides/testing.md`).
+
 ## Provider Server (main.go)
 
 The entry point wraps the provider into a gRPC server:
@@ -160,28 +193,24 @@ package main
 
 import (
     "context"
-    "flag"
     "log"
 
+    "github.com/TrogonStack/terraform-provider-livekit/internal/provider"
     "github.com/hashicorp/terraform-plugin-framework/providerserver"
-    "github.com/way-platform/terraform-provider-googleworkspace/internal/provider"
 )
 
-var version = "dev"
+var version string = "dev"
 
 func main() {
-    var debug bool
-    flag.BoolVar(&debug, "debug", false, "set to true to run the provider with support for debuggers")
-    flag.Parse()
-
-    opts := providerserver.ServeOpts{
-        Address: "registry.terraform.io/way-platform/googleworkspace",
-        Debug:   debug,
-    }
-
-    err := providerserver.Serve(context.Background(), provider.New(version), opts)
+    err := providerserver.Serve(
+        context.Background(),
+        provider.New(version),
+        providerserver.ServeOpts{
+            Address: "registry.terraform.io/trogonstack/livekit",
+        },
+    )
     if err != nil {
-        log.Fatal(err.Error())
+        log.Fatal(err)
     }
 }
 ```
@@ -189,7 +218,7 @@ func main() {
 ## Related Framework References
 
 | File                                             | Contents                                    |
-| ------------------------------------------------ | ------------------------------------------- |
+| ---------------------------------------------------- | ---------------------------------------------- |
 | `framework/providers/index.mdx`                  | Provider interface, metadata, schema        |
 | `framework/providers/validate-configuration.mdx` | Provider-level validation                   |
 | `framework/provider-servers.mdx`                 | Server setup, protocol versions, debug mode |

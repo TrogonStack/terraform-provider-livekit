@@ -5,17 +5,15 @@
 Schemas define the shape of configuration, plan, and state data. Each attribute or block maps to a Go struct field via `tfsdk` tags.
 
 ```go
-type fooResourceModel struct {
-    Id          types.String          `tfsdk:"id"`
-    Name        types.String          `tfsdk:"name"`
-    Enabled     types.Bool            `tfsdk:"enabled"`
-    Tags        types.List            `tfsdk:"tags"`
-    Settings    *settingsModel        `tfsdk:"settings"`
-}
-
-type settingsModel struct {
-    MaxRetries types.Int64  `tfsdk:"max_retries"`
-    Timeout    types.String `tfsdk:"timeout"`
+type agentSecretResourceModel struct {
+    Id             types.String `tfsdk:"id"`
+    AgentId        types.String `tfsdk:"agent_id"`
+    Name           types.String `tfsdk:"name"`
+    Kind           types.String `tfsdk:"kind"`
+    ValueWo        types.String `tfsdk:"value_wo"`
+    ValueWoVersion types.Int64  `tfsdk:"value_wo_version"`
+    CreatedAt      types.String `tfsdk:"created_at"`
+    UpdatedAt      types.String `tfsdk:"updated_at"`
 }
 ```
 
@@ -24,7 +22,7 @@ type settingsModel struct {
 ### Primitives
 
 | Schema Type               | Go Type         | Notes               |
-| ------------------------- | --------------- | ------------------- |
+| -------------------------- | ---------------- | --------------------- |
 | `schema.StringAttribute`  | `types.String`  | UTF-8 string        |
 | `schema.BoolAttribute`    | `types.Bool`    | true/false          |
 | `schema.Int64Attribute`   | `types.Int64`   | 64-bit integer      |
@@ -33,29 +31,39 @@ type settingsModel struct {
 | `schema.Float32Attribute` | `types.Float32` | 32-bit float        |
 | `schema.NumberAttribute`  | `types.Number`  | Arbitrary precision |
 
+`livekit_agent_secret.value_wo_version` is a plain `schema.Int64Attribute{Required: true}`, backed by `types.Int64`.
+
 ### Collections
 
 | Schema Type            | Go Type      | Requires      |
-| ---------------------- | ------------ | ------------- |
+| ------------------------ | -------------- | --------------- |
 | `schema.ListAttribute` | `types.List` | `ElementType` |
 | `schema.MapAttribute`  | `types.Map`  | `ElementType` |
 | `schema.SetAttribute`  | `types.Set`  | `ElementType` |
 
+`livekit_agent.regions` is a `schema.SetAttribute` of strings, since region membership is unordered:
+
 ```go
-schema.ListAttribute{
+"regions": schema.SetAttribute{
     Optional:    true,
+    Computed:    true,
     ElementType: types.StringType,
+    PlanModifiers: []planmodifier.Set{
+        setplanmodifier.UseStateForUnknown(),
+    },
 }
 ```
 
 ### Nested Attributes (Protocol v6 only)
 
 | Schema Type                    | Go Type                  | Use Case                |
-| ------------------------------ | ------------------------ | ----------------------- |
+| --------------------------------- | -------------------------- | -------------------------- |
 | `schema.SingleNestedAttribute` | `*nestedModel`           | Single object           |
 | `schema.ListNestedAttribute`   | `[]nestedModel`          | Ordered list of objects |
 | `schema.MapNestedAttribute`    | `map[string]nestedModel` | Keyed objects           |
 | `schema.SetNestedAttribute`    | `[]nestedModel`          | Unique set of objects   |
+
+Neither resource in this provider uses nested attributes today; both schemas are flat. This table is here for when one is needed:
 
 ```go
 schema.SingleNestedAttribute{
@@ -72,49 +80,34 @@ schema.SingleNestedAttribute{
 Blocks are structural containers that appear as HCL blocks (with `{}` syntax). Use blocks for complex nested structures, especially when they can be optional or repeated.
 
 | Schema Type                | Go Type                               | HCL Syntax                              |
-| -------------------------- | ------------------------------------- | --------------------------------------- |
+| ----------------------------- | ---------------------------------------- | ------------------------------------------ |
 | `schema.SingleNestedBlock` | `*nestedModel` (pointer for optional) | `block_name { ... }`                    |
 | `schema.ListNestedBlock`   | `[]nestedModel`                       | `block_name { ... }` (repeated)         |
 | `schema.SetNestedBlock`    | `[]nestedModel`                       | `block_name { ... }` (unique, repeated) |
 
-```go
-resp.Schema = schema.Schema{
-    Attributes: map[string]schema.Attribute{
-        "id":   rsId(),
-        "name": schema.StringAttribute{Required: true},
-    },
-    Blocks: map[string]schema.Block{
-        "settings": schema.SingleNestedBlock{
-            Attributes: map[string]schema.Attribute{
-                "max_retries": schema.Int64Attribute{Optional: true},
-                "timeout":     schema.StringAttribute{Optional: true},
-            },
-        },
-    },
-}
-```
+This provider does not currently define any blocks; both `livekit_agent` and `livekit_agent_secret` are flat attribute bags. Reach for a block only if a future resource needs an optional, HCL-block-shaped nested structure.
 
 ### Blocks vs Nested Attributes
 
 | Use Blocks When                                      | Use Nested Attributes When             |
-| ---------------------------------------------------- | -------------------------------------- |
+| -------------------------------------------------------- | ------------------------------------------- |
 | Optional complex object (pointer nil = not provided) | Always-present object structure        |
 | Matching existing Terraform provider conventions     | New providers (preferred direction)    |
 | HCL block syntax feels natural for the structure     | Programmatic, data-oriented structures |
-
-In this provider, we use `schema.SingleNestedBlock` for optional nested objects (e.g., `restrictions` on drives).
 
 ## Attribute Behaviors
 
 ### Required, Optional, Computed
 
 | Combination                                    | Meaning                                    |
-| ---------------------------------------------- | ------------------------------------------ |
+| ------------------------------------------------- | ---------------------------------------------- |
 | `Required: true`                               | User must provide; error if missing        |
 | `Optional: true`                               | User may provide; null if omitted          |
 | `Computed: true`                               | Provider sets the value; user cannot       |
 | `Optional: true, Computed: true`               | User may provide OR provider fills         |
 | `Optional: true, Computed: true, Default: ...` | User may provide; known default if omitted |
+
+`livekit_agent.agent_id`, `agent_name`, `version`, and `deployed_at` are `Computed: true`. `regions` is `Optional: true, Computed: true` (no `Default`, since the provider does not know which region LiveKit Cloud will pick). `livekit_agent_secret.kind` is `Optional: true, Computed: true, Default: stringdefault.StaticString("environment")`.
 
 ### Sensitive
 
@@ -125,6 +118,8 @@ schema.StringAttribute{
 }
 ```
 
+The provider's own `api_secret` attribute and `livekit_agent_secret.value_wo` are both `Sensitive: true`.
+
 ### Deprecation
 
 ```go
@@ -134,33 +129,23 @@ schema.StringAttribute{
 }
 ```
 
+Not used anywhere in this provider yet.
+
 ## Defaults
 
 Set a known value when the user does not provide one. Requires `Optional: true, Computed: true`.
 
 ```go
-import "github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 import "github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
-import "github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
-
-schema.BoolAttribute{
-    Optional: true,
-    Computed: true,
-    Default:  booldefault.StaticBool(false),
-}
 
 schema.StringAttribute{
     Optional: true,
     Computed: true,
-    Default:  stringdefault.StaticString("/"),
-}
-
-schema.Int64Attribute{
-    Optional: true,
-    Computed: true,
-    Default:  int64default.StaticInt64(3),
+    Default:  stringdefault.StaticString(string(secretKindEnvironment)),
 }
 ```
+
+This is the actual `kind` attribute on `livekit_agent_secret` (`secretKindEnvironment` is defined in `secret_kind.go`).
 
 ## Plan Modifiers
 
@@ -185,6 +170,8 @@ schema.StringAttribute{
 }
 ```
 
+`livekit_agent_secret.agent_id`, `name`, and `kind` all use `stringplanmodifier.RequiresReplace()`, since changing any of them means a different secret, not an update to the current one.
+
 ## Validators
 
 Constrain acceptable values at plan time.
@@ -194,17 +181,20 @@ import "github.com/hashicorp/terraform-plugin-framework-validators/stringvalidat
 import "github.com/hashicorp/terraform-plugin-framework/schema/validator"
 
 schema.StringAttribute{
-    Required: true,
+    Optional: true,
+    Computed: true,
+    Default:  stringdefault.StaticString(string(secretKindEnvironment)),
     Validators: []validator.String{
-        stringvalidator.LengthBetween(1, 256),
-        stringvalidator.RegexMatches(regexp.MustCompile(`^[a-z]`), "must start with lowercase letter"),
+        stringvalidator.OneOf(string(secretKindEnvironment), string(secretKindFile)),
     },
 }
 ```
 
+This is `livekit_agent_secret.kind`, restricted to `environment` or `file`.
+
 ## The `rsId()` Helper
 
-This provider's standard ID attribute pattern:
+This provider's standard ID attribute pattern, defined in `helpers.go`:
 
 ```go
 func rsId() schema.StringAttribute {
@@ -218,38 +208,35 @@ func rsId() schema.StringAttribute {
 }
 ```
 
-Use `"id": rsId()` in every resource schema.
+Use `"id": rsId()` in every resource schema. `livekit_agent.id` is the agent ID; `livekit_agent_secret.id` is `<agent_id>/<name>`.
 
 ## Accessing Values from Models
 
 ```go
 // Read plan/config into model
-var plan fooResourceModel
+var plan agentResourceModel
 resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 
 // Access primitive values
-name := plan.Name.ValueString()
-enabled := plan.Enabled.ValueBool()
-count := plan.Count.ValueInt64()
+agentId := plan.Id.ValueString()
 
 // Check null/unknown
-if plan.Name.IsNull() { /* user did not set */ }
-if plan.Name.IsUnknown() { /* will be known after apply */ }
+if plan.Regions.IsNull() { /* user did not set */ }
+if plan.Regions.IsUnknown() { /* will be known after apply */ }
 
-// Access list elements
-var tags []string
-resp.Diagnostics.Append(plan.Tags.ElementsAs(ctx, &tags, false)...)
+// Access set elements
+var regions []string
+resp.Diagnostics.Append(plan.Regions.ElementsAs(ctx, &regions, false)...)
 
 // Set values
-plan.Id = types.StringValue("computed-id")
-plan.Enabled = types.BoolValue(true)
-plan.Tags = types.ListNull(types.StringType) // null list
+plan.AgentId = types.StringValue("agent-123")
+plan.Regions = types.SetValueMust(types.StringType, []attr.Value{})
 ```
 
 ## Related Framework References
 
 | File                                                   | Contents                              |
-| ------------------------------------------------------ | ------------------------------------- |
+| ---------------------------------------------------------- | ------------------------------------------ |
 | `framework/handling-data/schemas.mdx`                  | Schema definition fundamentals        |
 | `framework/handling-data/attributes/index.mdx`         | All attribute types overview          |
 | `framework/handling-data/attributes/string.mdx`        | String attribute details              |

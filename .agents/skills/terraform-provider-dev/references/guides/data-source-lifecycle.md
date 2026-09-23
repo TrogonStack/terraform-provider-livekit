@@ -1,5 +1,7 @@
 # Data Source Lifecycle
 
+The provider does not define any data sources today (`DataSources()` in `provider.go` returns an empty slice). Everything below is the pattern to follow when one is added, built from the same client and lookup helpers the two resources already use.
+
 ## Interface
 
 A data source must implement `datasource.DataSource`:
@@ -14,18 +16,18 @@ type DataSource interface {
 
 Optional interfaces:
 
-- `datasource.DataSourceWithConfigure` — receive provider client
-- `datasource.DataSourceWithValidateConfig` — configuration validation
+- `datasource.DataSourceWithConfigure`: receive provider client
+- `datasource.DataSourceWithValidateConfig`: configuration validation
 
 ## Registration
 
 ```go
-func newBarDataSource() datasource.DataSource { return &barDataSource{} }
+func newAgentDataSource() datasource.DataSource { return &agentDataSource{} }
 
 // In provider.go:
-func (p *googleworkspaceProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
+func (p *livekitProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
     return []func() datasource.DataSource{
-        newBarDataSource,
+        newAgentDataSource,
     }
 }
 ```
@@ -33,8 +35,8 @@ func (p *googleworkspaceProvider) DataSources(ctx context.Context) []func() data
 ## Metadata
 
 ```go
-func (d *barDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
-    resp.TypeName = req.ProviderTypeName + "_bar"
+func (d *agentDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
+    resp.TypeName = req.ProviderTypeName + "_agent"
 }
 ```
 
@@ -45,11 +47,12 @@ Data source schemas use `datasource/schema` package (not `resource/schema`):
 ```go
 import "github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 
-func (d *barDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
+func (d *agentDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
     resp.Schema = schema.Schema{
         Attributes: map[string]schema.Attribute{
-            "id":   schema.StringAttribute{Computed: true},
-            "name": schema.StringAttribute{Required: true},
+            "agent_id":   schema.StringAttribute{Required: true},
+            "agent_name": schema.StringAttribute{Computed: true},
+            "version":    schema.StringAttribute{Computed: true},
         },
     }
 }
@@ -67,7 +70,7 @@ Key differences from resource schemas:
 Same pattern as resources:
 
 ```go
-func (d *barDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
+func (d *agentDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
     if req.ProviderData == nil {
         return
     }
@@ -86,46 +89,40 @@ func (d *barDataSource) Configure(_ context.Context, req datasource.ConfigureReq
 Contract:
 
 - Read configuration from `req.Config` (the user-provided lookup criteria)
-- Perform API call to find the data
+- Perform the API call to find the data
 - If not found: add an error diagnostic (data sources must find their target)
 - Set all attribute values in `resp.State`
 
+The CloudAgent API has no single-item get RPC; both resources look an item up by filtering `ListAgents`/`ListAgentSecrets` client-side (see `agentResource.findAgent` and `agentSecretResource.findSecret` in `resource_agent.go` / `resource_agent_secret.go`). A data source would follow the same shape, but treat "not found" as an error instead of a state removal:
+
 ```go
-func (d *barDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
-    var data barDataSourceModel
+func (d *agentDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
+    var data agentDataSourceModel
     resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
     if resp.Diagnostics.HasError() {
         return
     }
 
-    svc, err := d.client.NewDirectoryService(ctx)
+    agentId := data.AgentId.ValueString()
+    listResp, err := d.client.agent.ListAgents(ctx, &livekit.ListAgentsRequest{AgentId: agentId})
     if err != nil {
-        resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create service: %s", err))
+        resp.Diagnostics.AddError("API Error", fmt.Sprintf("Unable to list agents: %s", err))
         return
     }
 
-    // Lookup by name, page through results if needed
-    name := data.Name.ValueString()
-    var found *api.Item
-    err = svc.Items.List(d.client.customerID).Pages(ctx, func(page *api.Items) error {
-        for _, item := range page.Items {
-            if item.Name == name {
-                found = item
-            }
+    var found *livekit.AgentInfo
+    for _, a := range listResp.Agents {
+        if a.AgentId == agentId {
+            found = a
         }
-        return nil
-    })
-    if err != nil {
-        resp.Diagnostics.AddError("API Error", fmt.Sprintf("Unable to list items: %s", err))
-        return
     }
-
     if found == nil {
-        resp.Diagnostics.AddError("Not Found", fmt.Sprintf("Item %q not found", name))
+        resp.Diagnostics.AddError("Not Found", fmt.Sprintf("Agent %q not found", agentId))
         return
     }
 
-    data.Id = types.StringValue(found.Id)
+    data.AgentName = types.StringValue(found.AgentName)
+    data.Version = types.StringValue(found.Version)
     resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 ```
@@ -133,7 +130,7 @@ func (d *barDataSource) Read(ctx context.Context, req datasource.ReadRequest, re
 ## Data Sources vs Resources
 
 | Aspect           | Resource                     | Data Source          |
-| ---------------- | ---------------------------- | -------------------- |
+| ------------------ | ------------------------------- | ----------------------- |
 | Purpose          | Manage lifecycle (CRUD)      | Read-only lookup     |
 | Methods          | Create, Read, Update, Delete | Read only            |
 | Import           | Supported                    | N/A                  |
@@ -145,7 +142,7 @@ func (d *barDataSource) Read(ctx context.Context, req datasource.ReadRequest, re
 ## Related Framework References
 
 | File                                                | Contents                            |
-| --------------------------------------------------- | ----------------------------------- |
+| ------------------------------------------------------ | -------------------------------------- |
 | `framework/data-sources/index.mdx`                  | Data source interface, registration |
 | `framework/data-sources/configure.mdx`              | Configure method                    |
 | `framework/data-sources/validate-configuration.mdx` | Validation                          |

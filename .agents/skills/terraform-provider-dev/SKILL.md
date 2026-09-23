@@ -1,7 +1,7 @@
 ---
 name: terraform-provider-dev
 description: >
-  Use this skill when developing terraform-provider-googleworkspace: adding
+  Use this skill when developing terraform-provider-livekit: adding
   resources or data sources, designing schemas, implementing CRUD operations,
   plan modification, state upgrades, import, validation, acceptance testing,
   debugging, or any Terraform Plugin Framework work in Go. Also use when the
@@ -17,27 +17,31 @@ description: >
 - Resource = struct implementing `resource.Resource` interface: Metadata, Schema, Configure, Create, Read, Update, Delete
 - DataSource = struct implementing `datasource.DataSource` interface: Metadata, Schema, Configure, Read
 - Schema defines the "shape" of config/plan/state: attributes (leaf values) and blocks (nested structures)
-- Plan → Apply: Terraform calls PlanResourceChange (propose changes), then ApplyResourceChange (execute)
+- Plan then Apply: Terraform calls PlanResourceChange (propose changes), then ApplyResourceChange (execute)
 - State = Terraform's record of the real world; Plan = expected post-apply state
 - Computed attributes: set by the provider from API responses (IDs, timestamps, server-generated values)
 - Plugin Framework uses strong Go types: `types.String`, `types.Bool`, `types.Int64`, `types.List`, etc.
-- Null vs Unknown: null = user did not set; unknown = value will be known after apply (planned computed)
+- Null vs Unknown: null means the user did not set it; unknown means the value will be known after apply (planned computed)
 
 ---
 
 ## This Provider: Conventions
 
-- **Package**: `internal/provider`
+- **Package**: `internal/provider` (single flat package, all resources here)
 - **File naming**: `resource_<name>.go`, `resource_<name>_test.go`, `data_source_<name>.go`
-- **Provider client**: `*apiClient` (wraps retryable HTTP client + customerID + basePath)
+- **Provider client**: `*apiClient` wraps `*lksdk.AgentClient` (`github.com/livekit/server-sdk-go/v2`), which signs an agent-admin JWT and dials the CloudAgent Twirp service
 - **Client injection**: Configure method casts `req.ProviderData.(*apiClient)`
 - **ID helper**: `rsId()` returns a Computed StringAttribute with `UseStateForUnknown`
-- **Import helper**: `importSplitId(ctx, req, resp, boolAttr, idAttr)` for compound import IDs like `"true,drive-123"`
-- **Simple import**: `resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)`
-- **Registration**: Add constructor to `Resources()` or `DataSources()` in `provider.go`
-- **Google API booleans**: Always use `ForceSendFields` to send false-valued booleans (Google API client uses omitempty)
-- **404 handling**: Read → `resp.State.RemoveResource(ctx)` (resource deleted externally); Delete → return silently (idempotent)
-- **Testing**: Mock HTTP server with `setupTestServer` + `setupTestClient`, no real API calls
+- **Simple import**: `resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)` (used by `livekit_agent`)
+- **Compound import**: `parseAgentSecretImportID(raw)` parses `<agent_id>/<name>` (used by `livekit_agent_secret`)
+- **Registration**: add the constructor to `Resources()` in `provider.go`; `DataSources()` is currently empty
+- **Not-found handling**: Twirp reports a missing agent or secret as an error with code `twirp.NotFound`, never an empty success response. Detect it with `isNotFound(err)` in `errors.go`, which unwraps with `errors.As` into the `twirp.Error` interface (a wrapped error would fail a direct type assertion)
+  - **Read**: call `resp.State.RemoveResource(ctx)` and return (resource was deleted externally)
+  - **Delete**: return without error (idempotent)
+- **API success check**: every mutating CloudAgent RPC returns a `Success`/`Message` pair on top of the transport error. Check `!resp.Success` after the `err != nil` check and surface `resp.Message`
+- **Write-only secrets**: `livekit_agent_secret.value_wo` is read from `req.Config`, never `req.Plan`, and never written to state. `value_wo_version` (a plain `Int64`) is what tells the provider a new value must be sent; the value itself is never diffed
+- **Retry**: `retry.go` wraps the client's HTTP transport with automatic retry on 429 and 5xx except 501. No configuration attribute
+- **Testing**: an in-memory `fakeCloudAgent` implements the generated `livekit.CloudAgent` Twirp interface; `setupTestServer` + `setupTestClient` wire it up, no real API calls
 
 ---
 
@@ -99,34 +103,36 @@ func (r *fooResource) Configure(_ context.Context, req resource.ConfigureRequest
 
 ## Adding a Data Source
 
+The provider does not define any data sources yet (`DataSources()` returns an empty slice). The shape below is illustrative, following the same lookup pattern the resources already use with `ListAgents`/`ListAgentSecrets`:
+
 ```go
-var _ datasource.DataSource = &barDataSource{}
+var _ datasource.DataSource = &agentDataSource{}
 
-func newBarDataSource() datasource.DataSource { return &barDataSource{} }
+func newAgentDataSource() datasource.DataSource { return &agentDataSource{} }
 
-type barDataSource struct {
+type agentDataSource struct {
     client *apiClient
 }
 
-type barDataSourceModel struct {
-    Id   types.String `tfsdk:"id"`
-    Name types.String `tfsdk:"name"`
+type agentDataSourceModel struct {
+    Id      types.String `tfsdk:"id"`
+    AgentId types.String `tfsdk:"agent_id"`
 }
 
-func (d *barDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
-    resp.TypeName = req.ProviderTypeName + "_bar"
+func (d *agentDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
+    resp.TypeName = req.ProviderTypeName + "_agent"
 }
 
-func (d *barDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
+func (d *agentDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
     resp.Schema = schema.Schema{
         Attributes: map[string]schema.Attribute{
-            "id":   schema.StringAttribute{Computed: true},
-            "name": schema.StringAttribute{Required: true},
+            "id":       schema.StringAttribute{Computed: true},
+            "agent_id": schema.StringAttribute{Required: true},
         },
     }
 }
 
-func (d *barDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
+func (d *agentDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
     if req.ProviderData == nil {
         return
     }
@@ -138,8 +144,8 @@ func (d *barDataSource) Configure(_ context.Context, req datasource.ConfigureReq
     d.client = client
 }
 
-func (d *barDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
-    var data barDataSourceModel
+func (d *agentDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
+    var data agentDataSourceModel
     resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
     if resp.Diagnostics.HasError() {
         return
@@ -149,28 +155,28 @@ func (d *barDataSource) Read(ctx context.Context, req datasource.ReadRequest, re
 }
 ```
 
-Register: add `newBarDataSource` to `DataSources()` in `provider.go`.
+Register: add `newAgentDataSource` to `DataSources()` in `provider.go`.
 
 ---
 
 ## Schema Design Quick-Reference
 
 | Schema Type                                                                                    | Go Model Type            | When to Use                    |
-| ---------------------------------------------------------------------------------------------- | ------------------------ | ------------------------------ |
+| ---------------------------------------------------------------------------------------------- | ------------------------ | ------------------------------- |
 | `schema.StringAttribute{Required: true}`                                                       | `types.String`           | User must provide              |
 | `schema.StringAttribute{Optional: true}`                                                       | `types.String`           | User may provide               |
 | `schema.StringAttribute{Computed: true}`                                                       | `types.String`           | Server-generated only          |
 | `schema.StringAttribute{Optional: true, Computed: true}`                                       | `types.String`           | User provides OR server fills  |
-| `schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(false)}` | `types.Bool`             | Bool with known default        |
-| `schema.ListAttribute{ElementType: types.StringType}`                                          | `types.List`             | List of primitives             |
-| `schema.SingleNestedBlock{Attributes: ...}`                                                    | `*nestedModel` (pointer) | Nested object (optional block) |
+| `schema.SetAttribute{Optional: true, Computed: true, ElementType: types.StringType}`            | `types.Set`              | Set with a server-influenced default (`livekit_agent.regions`) |
+| `schema.StringAttribute{Optional: true, Computed: true, Default: stringdefault.StaticString(...)}` | `types.String`        | Attribute with a known default (`livekit_agent_secret.kind`) |
 
 ### Plan Modifiers
 
 | Modifier                                  | Use Case                                   |
-| ----------------------------------------- | ------------------------------------------ |
-| `stringplanmodifier.UseStateForUnknown()` | Computed value stable across updates (IDs) |
-| `stringplanmodifier.RequiresReplace()`    | Changing this forces resource recreation   |
+| ------------------------------------------ | ------------------------------------------ |
+| `stringplanmodifier.UseStateForUnknown()` | Computed value stable across updates (`rsId()`, `agent_id`) |
+| `stringplanmodifier.RequiresReplace()`    | Changing this forces resource recreation (`agent_id`, `name`, `kind` on `livekit_agent_secret`) |
+| `setplanmodifier.UseStateForUnknown()`    | Same idea, for a Set attribute (`regions`) |
 
 Full details: `references/guides/schema-design.md`
 
@@ -182,15 +188,14 @@ Full details: `references/guides/schema-design.md`
 
 ```go
 var testAccProtoV6ProviderFactories = map[string]func() (tfprotov6.ProviderServer, error){
-    "googleworkspace": providerserver.NewProtocol6WithError(New("test")()),
+    "livekit": providerserver.NewProtocol6WithError(New("test")()),
 }
 
 const testProviderConfig = `
-provider "googleworkspace" {
-  access_token            = "test-token"
-  service_account         = "test@test.iam.gserviceaccount.com"
-  impersonated_user_email = "admin@test.com"
-  customer_id             = "C00000000"
+provider "livekit" {
+  url        = "https://test.livekit.cloud"
+  api_key    = "test-key"
+  api_secret = "test-secret"
 }
 `
 ```
@@ -198,20 +203,9 @@ provider "googleworkspace" {
 ### Test Structure
 
 ```go
-func TestAccFoo_Basic(t *testing.T) {
-    server := setupTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        switch {
-        case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/foos"):
-            jsonResponse(w, 200, map[string]any{"id": "foo-123", "name": "test"})
-        case r.Method == "GET" && strings.Contains(r.URL.Path, "/foos/foo-123"):
-            jsonResponse(w, 200, map[string]any{"id": "foo-123", "name": "test"})
-        case r.Method == "DELETE" && strings.Contains(r.URL.Path, "/foos/foo-123"):
-            w.WriteHeader(204)
-        default:
-            t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-            w.WriteHeader(500)
-        }
-    }))
+func TestAccAgent_Basic(t *testing.T) {
+    fake := newFakeCloudAgent()
+    server := setupTestServer(t, livekit.NewCloudAgentServer(fake))
     setupTestClient(t, server)
 
     resource.Test(t, resource.TestCase{
@@ -219,13 +213,13 @@ func TestAccFoo_Basic(t *testing.T) {
         Steps: []resource.TestStep{
             {
                 Config: testProviderConfig + `
-resource "googleworkspace_foo" "test" {
-  name = "test"
+resource "livekit_agent" "test" {
+  regions = ["us-east", "us-west"]
 }
 `,
                 Check: resource.ComposeAggregateTestCheckFunc(
-                    resource.TestCheckResourceAttr("googleworkspace_foo.test", "id", "foo-123"),
-                    resource.TestCheckResourceAttr("googleworkspace_foo.test", "name", "test"),
+                    resource.TestCheckResourceAttrSet("livekit_agent.test", "id"),
+                    resource.TestCheckResourceAttr("livekit_agent.test", "regions.#", "2"),
                 ),
             },
         },
@@ -237,7 +231,7 @@ resource "googleworkspace_foo" "test" {
 
 ```bash
 go test ./internal/provider/ -v -run TestAcc
-go test ./internal/provider/ -v -run TestAccDrive
+go test ./internal/provider/ -v -run TestAccAgent
 ```
 
 Full details: `references/guides/testing.md`
@@ -246,10 +240,10 @@ Full details: `references/guides/testing.md`
 
 ## State Upgrade
 
-When changing a resource schema in a breaking way (e.g., changing a list block to SingleNestedBlock):
+Neither resource has needed one yet (`Schema` sets no `Version`, so it defaults to 0, and no resource implements `resource.ResourceWithUpgradeState`). If a future breaking schema change requires one (e.g., changing `regions` from a Set to a nested block):
 
 1. Increment `Version` in the schema
-2. Implement `resource.ResourceWithUpgradeState` interface
+2. Implement `resource.ResourceWithUpgradeState`
 3. Parse raw JSON state and write to current model
 
 ```go
@@ -279,23 +273,23 @@ Full details: `references/guides/state-management.md`
 ### Topic Guides (synthesized, task-oriented)
 
 | Guide                                         | Contents                                              |
-| --------------------------------------------- | ----------------------------------------------------- |
+| ---------------------------------------------- | ------------------------------------------------------ |
 | `references/guides/resource-lifecycle.md`     | CRUD methods, interface contracts, registration       |
 | `references/guides/data-source-lifecycle.md`  | Data source pattern, Read method                      |
 | `references/guides/schema-design.md`          | Attributes, blocks, types, nested models              |
 | `references/guides/plan-modification.md`      | UseStateForUnknown, RequiresReplace, custom modifiers |
 | `references/guides/state-management.md`       | Import, state upgrade, private state                  |
 | `references/guides/validation.md`             | Attribute validators, resource-level validation       |
-| `references/guides/testing.md`                | Acceptance tests, mock server, test steps             |
+| `references/guides/testing.md`                | Acceptance tests, fake CloudAgent server, test steps  |
 | `references/guides/provider-configuration.md` | Provider setup, client injection, servers             |
 | `references/guides/functions.md`              | Provider-defined functions (Terraform 1.8+)           |
 
-### Framework Reference (verbatim, 148 files)
+### Framework Reference (verbatim, upstream HashiCorp docs)
 
 Key entry points in `references/framework/`:
 
 | File                                 | Contents                         |
-| ------------------------------------ | -------------------------------- |
+| ------------------------------------- | --------------------------------- |
 | `resources/index.mdx`                | Resource interface, registration |
 | `resources/create.mdx`               | Create method contract           |
 | `resources/read.mdx`                 | Read method, refresh state       |

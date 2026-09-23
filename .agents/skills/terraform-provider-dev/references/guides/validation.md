@@ -4,8 +4,8 @@
 
 Validation runs during `terraform validate`, `terraform plan`, and `terraform apply`. It returns diagnostics (warnings/errors) before any API calls happen. Validation occurs at two levels:
 
-1. **Attribute-level validators** — validate individual attribute values
-2. **Resource/data-source-level validation** — cross-attribute validation logic
+1. **Attribute-level validators**: validate individual attribute values
+2. **Resource/data-source-level validation**: cross-attribute validation logic
 
 Important: configuration values may be unknown during validation (references to other resources). Validators must handle this by returning early without diagnostics.
 
@@ -17,43 +17,27 @@ Add validators to any attribute's `Validators` field. All validators in the slic
 import (
     "github.com/hashicorp/terraform-plugin-framework/schema/validator"
     "github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
-    "github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
-    "github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 )
 
 schema.StringAttribute{
-    Required: true,
-    Validators: []validator.String{
-        stringvalidator.LengthBetween(1, 256),
-        stringvalidator.RegexMatches(
-            regexp.MustCompile(`^[a-z][a-z0-9-]*$`),
-            "must start with lowercase letter, contain only lowercase alphanumeric and hyphens",
-        ),
-    },
-}
-
-schema.Int64Attribute{
     Optional: true,
-    Validators: []validator.Int64{
-        int64validator.Between(1, 100),
-    },
-}
-
-schema.ListAttribute{
-    Optional:    true,
-    ElementType: types.StringType,
-    Validators: []validator.List{
-        listvalidator.SizeAtMost(10),
+    Computed: true,
+    Default:  stringdefault.StaticString(string(secretKindEnvironment)),
+    MarkdownDescription: "One of `environment` or `file`. Defaults to `environment`.",
+    Validators: []validator.String{
+        stringvalidator.OneOf(string(secretKindEnvironment), string(secretKindFile)),
     },
 }
 ```
+
+This is the actual `kind` attribute on `livekit_agent_secret` (`resource_agent_secret.go`), the only validator currently used anywhere in this provider. The `stringvalidator.OneOf` constraint mirrors what `parseSecretKind` in `secret_kind.go` accepts at apply time; the validator gives the practitioner the same error earlier, at plan time.
 
 ## Common Validators (terraform-plugin-framework-validators)
 
 ### String
 
 | Validator                                     | Description           |
-| --------------------------------------------- | --------------------- |
+| ------------------------------------------------- | ------------------------ |
 | `stringvalidator.LengthBetween(min, max)`     | String length range   |
 | `stringvalidator.LengthAtLeast(min)`          | Minimum length        |
 | `stringvalidator.LengthAtMost(max)`           | Maximum length        |
@@ -66,7 +50,7 @@ schema.ListAttribute{
 ### Int64
 
 | Validator                          | Description       |
-| ---------------------------------- | ----------------- |
+| -------------------------------------- | -------------------- |
 | `int64validator.Between(min, max)` | Range (inclusive) |
 | `int64validator.AtLeast(min)`      | Minimum           |
 | `int64validator.AtMost(max)`       | Maximum           |
@@ -75,17 +59,19 @@ schema.ListAttribute{
 ### Bool
 
 | Validator                    | Description  |
-| ---------------------------- | ------------ |
+| --------------------------------- | -------------- |
 | `boolvalidator.Equals(true)` | Must be true |
 
 ### List/Set/Map
 
 | Validator                             | Description           |
-| ------------------------------------- | --------------------- |
+| ------------------------------------------ | ------------------------ |
 | `listvalidator.SizeAtLeast(min)`      | Minimum element count |
 | `listvalidator.SizeAtMost(max)`       | Maximum element count |
 | `listvalidator.SizeBetween(min, max)` | Element count range   |
 | `listvalidator.UniqueValues()`        | No duplicate elements |
+
+`setvalidator` has the same shapes for `livekit_agent.regions`, though this provider does not currently constrain it (any region string LiveKit Cloud accepts is passed through as-is).
 
 ## Conflict/Dependency Validators
 
@@ -135,32 +121,34 @@ schema.StringAttribute{
 }
 ```
 
+Not used anywhere in this provider today; both resource schemas are small enough that no attribute's validity depends on another's.
+
 ## Custom Validators
 
-Implement the `validator.<Type>` interface:
+Implement the `validator.<Type>` interface. This provider has no custom validators today (`stringvalidator.OneOf` above covers its one constrained attribute); the shape below is illustrative:
 
 ```go
-type emailValidator struct{}
+type secretNameValidator struct{}
 
-func (v emailValidator) Description(_ context.Context) string {
-    return "value must be a valid email address"
+func (v secretNameValidator) Description(_ context.Context) string {
+    return "value must be a non-empty secret name"
 }
 
-func (v emailValidator) MarkdownDescription(_ context.Context) string {
-    return "value must be a valid email address"
+func (v secretNameValidator) MarkdownDescription(_ context.Context) string {
+    return "value must be a non-empty secret name"
 }
 
-func (v emailValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+func (v secretNameValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
     if req.ConfigValue.IsUnknown() || req.ConfigValue.IsNull() {
         return
     }
 
     value := req.ConfigValue.ValueString()
-    if !strings.Contains(value, "@") {
+    if strings.TrimSpace(value) == "" {
         resp.Diagnostics.AddAttributeError(
             req.Path,
-            "Invalid Email",
-            fmt.Sprintf("%q is not a valid email address", value),
+            "Invalid Secret Name",
+            fmt.Sprintf("%q is not a valid secret name", value),
         )
     }
 }
@@ -168,35 +156,34 @@ func (v emailValidator) ValidateString(_ context.Context, req validator.StringRe
 // Usage:
 schema.StringAttribute{
     Required:   true,
-    Validators: []validator.String{emailValidator{}},
+    Validators: []validator.String{secretNameValidator{}},
 }
 ```
 
 ## Resource-Level Validation
 
-For cross-attribute validation that requires access to multiple fields:
+For cross-attribute validation that requires access to multiple fields. Not used anywhere in this provider today (neither `agentResource` nor `agentSecretResource` implements `resource.ResourceWithValidateConfig`); the shape below is illustrative:
 
 ```go
-var _ resource.ResourceWithValidateConfig = &fooResource{}
+var _ resource.ResourceWithValidateConfig = &agentSecretResource{}
 
-func (r *fooResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
-    var data fooResourceModel
+func (r *agentSecretResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+    var data agentSecretResourceModel
     resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
     if resp.Diagnostics.HasError() {
         return
     }
 
     // Skip validation if values are unknown (references to other resources)
-    if data.FieldA.IsUnknown() || data.FieldB.IsUnknown() {
+    if data.Kind.IsUnknown() || data.Name.IsUnknown() {
         return
     }
 
-    // Cross-attribute validation
-    if data.FieldA.ValueString() == "special" && data.FieldB.IsNull() {
+    if data.Kind.ValueString() == "file" && data.Name.ValueString() == "" {
         resp.Diagnostics.AddAttributeError(
-            path.Root("field_b"),
+            path.Root("name"),
             "Missing Required Field",
-            "field_b is required when field_a is 'special'",
+            "name is required when kind is 'file'",
         )
     }
 }
@@ -222,10 +209,12 @@ if resp.Diagnostics.HasError() {
 }
 ```
 
+Both resources use `resp.Diagnostics.AddError("API Error", ...)` and `resp.Diagnostics.AddError("Invalid Configuration", ...)` (for a `parseSecretKind` failure) as their primary error-reporting pattern; see `references/guides/resource-lifecycle.md`.
+
 ## Related Framework References
 
 | File                                                | Contents                      |
-| --------------------------------------------------- | ----------------------------- |
+| -------------------------------------------------------- | -------------------------------- |
 | `framework/validation.mdx`                          | Full validation documentation |
 | `framework/diagnostics.mdx`                         | Diagnostics (errors/warnings) |
 | `framework/resources/validate-configuration.mdx`    | Resource-level validation     |

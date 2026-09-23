@@ -15,7 +15,7 @@ After validation and before apply, Terraform generates a plan describing expecte
 3. Attribute plan modifiers run (in schema order)
 4. Resource-level plan modifiers run (`ModifyPlan`)
 
-After apply, all state values MUST match planned values or Terraform produces "Provider produced inconsistent result" error.
+After apply, all state values MUST match planned values or Terraform produces a "Provider produced inconsistent result" error.
 
 ## Built-in Attribute Plan Modifiers
 
@@ -36,7 +36,7 @@ schema.StringAttribute{
 }
 ```
 
-This provider's `rsId()` helper wraps this pattern for ID attributes.
+This provider's `rsId()` helper wraps this pattern for ID attributes. `livekit_agent.agent_id` uses the same modifier directly, since it is computed but stable once the agent is created.
 
 ### RequiresReplace
 
@@ -50,6 +50,8 @@ schema.StringAttribute{
     },
 }
 ```
+
+`livekit_agent_secret.agent_id`, `name`, and `kind` all use this: the CloudAgent API has no "rename a secret" or "move a secret to a different agent" operation, so any of those changing means a different secret, not an update.
 
 ### RequiresReplaceIf
 
@@ -66,6 +68,8 @@ stringplanmodifier.RequiresReplaceIf(
 )
 ```
 
+Not used anywhere in this provider yet.
+
 ### RequiresReplaceIfConfigured
 
 Like RequiresReplace but only triggers if the practitioner explicitly configured the value (not null):
@@ -79,7 +83,7 @@ stringplanmodifier.RequiresReplaceIfConfigured()
 Each type has its own package:
 
 | Type    | Package                               | Modifiers                                                                           |
-| ------- | ------------------------------------- | ----------------------------------------------------------------------------------- |
+| --------- | ---------------------------------------- | ---------------------------------------------------------------------------------------- |
 | String  | `resource/schema/stringplanmodifier`  | UseStateForUnknown, RequiresReplace, RequiresReplaceIf, RequiresReplaceIfConfigured |
 | Bool    | `resource/schema/boolplanmodifier`    | UseStateForUnknown, RequiresReplace, RequiresReplaceIf, RequiresReplaceIfConfigured |
 | Int64   | `resource/schema/int64planmodifier`   | UseStateForUnknown, RequiresReplace, RequiresReplaceIf, RequiresReplaceIfConfigured |
@@ -88,6 +92,8 @@ Each type has its own package:
 | Map     | `resource/schema/mapplanmodifier`     | UseStateForUnknown, RequiresReplace, RequiresReplaceIf, RequiresReplaceIfConfigured |
 | Set     | `resource/schema/setplanmodifier`     | UseStateForUnknown, RequiresReplace, RequiresReplaceIf, RequiresReplaceIfConfigured |
 | Object  | `resource/schema/objectplanmodifier`  | UseStateForUnknown, RequiresReplace, RequiresReplaceIf, RequiresReplaceIfConfigured |
+
+`livekit_agent.regions` uses `setplanmodifier.UseStateForUnknown()`, the Set-typed counterpart to the String one above.
 
 ## Custom Plan Modifiers
 
@@ -116,6 +122,8 @@ func (m myModifier) PlanModifyString(_ context.Context, req planmodifier.StringR
 }
 ```
 
+Not used anywhere in this provider yet; both resources get by with the built-in modifiers above.
+
 ## Resource-Level Plan Modification
 
 Implement `resource.ResourceWithModifyPlan` for cross-attribute logic:
@@ -130,14 +138,12 @@ func (r *fooResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReq
         return
     }
 
-    // Example: warn when dangerous combination is planned
     var plan fooResourceModel
     resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-    if plan.DangerMode.ValueBool() && plan.Public.ValueBool() {
-        resp.Diagnostics.AddWarning("Security Warning", "Enabling danger mode on a public resource")
-    }
 }
 ```
+
+Not used anywhere in this provider yet.
 
 ## Common Patterns in This Provider
 
@@ -150,7 +156,7 @@ func (r *fooResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReq
 ### Immutable fields (force recreation)
 
 ```go
-"parent_id": schema.StringAttribute{
+"agent_id": schema.StringAttribute{
     Required: true,
     PlanModifiers: []planmodifier.String{
         stringplanmodifier.RequiresReplace(),
@@ -158,21 +164,40 @@ func (r *fooResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReq
 }
 ```
 
-### Computed with server default
+### Regions kept when the API doesn't echo them back
+
+`livekit_agent.regions` is `Optional: true, Computed: true` with `setplanmodifier.UseStateForUnknown()`:
 
 ```go
-"org_unit_path": schema.StringAttribute{
-    Optional: true,
-    Computed: true, // Server assigns "/" if not provided
+"regions": schema.SetAttribute{
+    Optional:    true,
+    Computed:    true,
+    ElementType: types.StringType,
+    PlanModifiers: []planmodifier.Set{
+        setplanmodifier.UseStateForUnknown(),
+    },
 }
 ```
 
-No UseStateForUnknown here because the value CAN change on update.
+The plan modifier only decides what goes on the *plan*; the actual gotcha lives in `applyAgentInfo` (`resource_agent.go`), which builds the value written to *state* after Create/Read/Update. `AgentInfo.AgentDeployments` is empty until the agent's first deployment finishes, so a freshly created agent can come back from the API with no regions at all even though the user configured some:
+
+```go
+switch {
+case len(regions) > 0:
+    set, d := types.SetValueFrom(ctx, types.StringType, regions)
+    diags.Append(d...)
+    model.Regions = set
+case model.Regions.IsUnknown():
+    model.Regions = types.SetValueMust(types.StringType, []attr.Value{})
+}
+```
+
+If the API reports no regions but the model already has a known, non-unknown value (i.e., it came from the configuration, not from a fresh Create), that branch is skipped and the configured value is left untouched. Only an unknown value (nothing to fall back to) gets forced to empty. The same "keep what's configured when the API doesn't echo it back" shape applies to `livekit_agent_secret.kind` in `applyAgentSecret`, for the `AGENT_SECRET_KIND_UNKNOWN` case (see `references/guides/testing.md`).
 
 ## Related Framework References
 
 | File                                        | Contents                             |
-| ------------------------------------------- | ------------------------------------ |
+| ---------------------------------------------- | ----------------------------------------- |
 | `framework/resources/plan-modification.mdx` | Full plan modification documentation |
 | `framework/resources/default.mdx`           | Default values (interact with plan)  |
 | `framework/handling-data/schemas.mdx`       | Schema definition                    |

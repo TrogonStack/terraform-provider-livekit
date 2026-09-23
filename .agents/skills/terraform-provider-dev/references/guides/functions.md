@@ -4,10 +4,12 @@
 
 Provider-defined functions (Terraform 1.8+) let practitioners call provider logic directly in expressions. Unlike resources/data sources, functions are pure computations: no state, no side effects.
 
+This provider defines no functions today. Everything below is illustrative, built around a plausible one: splitting a `livekit_agent_secret` compound ID (`<agent_id>/<name>`, the same format `parseAgentSecretImportID` in `helpers.go` already parses for import) into its two parts, so a practitioner could do this in an expression instead of only at import time:
+
 ```hcl
-# Usage in Terraform config:
-output "parsed" {
-  value = provider::googleworkspace::parse_email("user@example.com")
+# Usage in Terraform config (illustrative, this function does not exist):
+output "secret_agent_id" {
+  value = provider::livekit::parse_agent_secret_id("agent-123/MY_SECRET").agent_id
 }
 ```
 
@@ -30,51 +32,66 @@ package provider
 
 import (
     "context"
+    "fmt"
+    "strings"
 
     "github.com/hashicorp/terraform-plugin-framework/function"
+    "github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-var _ function.Function = &parseEmailFunction{}
+var _ function.Function = &parseAgentSecretIdFunction{}
 
-func newParseEmailFunction() function.Function {
-    return &parseEmailFunction{}
+func newParseAgentSecretIdFunction() function.Function {
+    return &parseAgentSecretIdFunction{}
 }
 
-type parseEmailFunction struct{}
+type parseAgentSecretIdFunction struct{}
 
-func (f *parseEmailFunction) Metadata(_ context.Context, req function.MetadataRequest, resp *function.MetadataResponse) {
-    resp.Name = "parse_email"
+func (f *parseAgentSecretIdFunction) Metadata(_ context.Context, req function.MetadataRequest, resp *function.MetadataResponse) {
+    resp.Name = "parse_agent_secret_id"
 }
 
-func (f *parseEmailFunction) Definition(_ context.Context, req function.DefinitionRequest, resp *function.DefinitionResponse) {
+func (f *parseAgentSecretIdFunction) Definition(_ context.Context, req function.DefinitionRequest, resp *function.DefinitionResponse) {
     resp.Definition = function.Definition{
-        Summary:     "Parses an email address into local and domain parts",
-        Description: "Given an email address, returns the local part (before @)",
+        Summary:     "Splits a livekit_agent_secret compound ID into its agent_id and name parts",
+        Description: "Given an ID in the `<agent_id>/<name>` format, returns an object with agent_id and name attributes.",
         Parameters: []function.Parameter{
             function.StringParameter{
-                Name:        "email",
-                Description: "The email address to parse",
+                Name:        "id",
+                Description: "The compound ID, e.g. \"agent-123/MY_SECRET\"",
             },
         },
-        Return: function.StringReturn{},
+        Return: function.ObjectReturn{
+            AttributeTypes: map[string]attr.Type{
+                "agent_id": types.StringType,
+                "name":     types.StringType,
+            },
+        },
     }
 }
 
-func (f *parseEmailFunction) Run(ctx context.Context, req function.RunRequest, resp *function.RunResponse) {
-    var email string
-    resp.Error = function.ConcatFuncErrors(req.Arguments.Get(ctx, &email))
+func (f *parseAgentSecretIdFunction) Run(ctx context.Context, req function.RunRequest, resp *function.RunResponse) {
+    var id string
+    resp.Error = function.ConcatFuncErrors(req.Arguments.Get(ctx, &id))
     if resp.Error != nil {
         return
     }
 
-    // Parse logic
-    parts := strings.SplitN(email, "@", 2)
-    if len(parts) != 2 {
-        resp.Error = function.NewFuncError("invalid email address: missing @")
+    parts := strings.SplitN(id, "/", 2)
+    if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+        resp.Error = function.NewArgumentFuncError(0, fmt.Sprintf("expected id in the format <agent_id>/<name>, got: %q", id))
         return
     }
 
-    resp.Error = function.ConcatFuncErrors(resp.Result.Set(ctx, parts[0]))
+    result, diags := types.ObjectValue(
+        map[string]attr.Type{"agent_id": types.StringType, "name": types.StringType},
+        map[string]attr.Value{"agent_id": types.StringValue(parts[0]), "name": types.StringValue(parts[1])},
+    )
+    resp.Error = function.ConcatFuncErrors(function.FuncErrorFromDiags(ctx, diags))
+    if resp.Error != nil {
+        return
+    }
+    resp.Error = function.ConcatFuncErrors(resp.Result.Set(ctx, result))
 }
 ```
 
@@ -83,28 +100,30 @@ func (f *parseEmailFunction) Run(ctx context.Context, req function.RunRequest, r
 Add to the provider's `Functions` method:
 
 ```go
-var _ provider.ProviderWithFunctions = &googleworkspaceProvider{}
+var _ provider.ProviderWithFunctions = &livekitProvider{}
 
-func (p *googleworkspaceProvider) Functions(_ context.Context) []func() function.Function {
+func (p *livekitProvider) Functions(_ context.Context) []func() function.Function {
     return []func() function.Function{
-        newParseEmailFunction,
+        newParseAgentSecretIdFunction,
     }
 }
 ```
 
+`livekitProvider` does not implement `provider.ProviderWithFunctions` today; this would be a new addition to `provider.go`, alongside `Resources()` and `DataSources()`.
+
 ## Parameter Types
 
 | Parameter Type              | Go Argument Type              |
-| --------------------------- | ----------------------------- |
+| ------------------------------ | -------------------------------- |
 | `function.StringParameter`  | `string`                      |
-| `function.BoolParameter`    | `bool`                        |
-| `function.Int64Parameter`   | `int64`                       |
-| `function.Float64Parameter` | `float64`                     |
+| `function.BoolParameter`    | `bool`                         |
+| `function.Int64Parameter`   | `int64`                        |
+| `function.Float64Parameter` | `float64`                       |
 | `function.ListParameter`    | `[]T` or `types.List`         |
 | `function.MapParameter`     | `map[string]T` or `types.Map` |
 | `function.SetParameter`     | `[]T` or `types.Set`          |
 | `function.ObjectParameter`  | struct or `types.Object`      |
-| `function.DynamicParameter` | `types.Dynamic`               |
+| `function.DynamicParameter` | `types.Dynamic`                |
 
 ### Variadic Parameter
 
@@ -131,11 +150,11 @@ func (f *joinFunction) Run(ctx context.Context, req function.RunRequest, resp *f
 ## Return Types
 
 | Return Type              | Go Result Type  |
-| ------------------------ | --------------- |
-| `function.StringReturn`  | `string`        |
-| `function.BoolReturn`    | `bool`          |
-| `function.Int64Return`   | `int64`         |
-| `function.Float64Return` | `float64`       |
+| --------------------------- | ------------------ |
+| `function.StringReturn`  | `string`         |
+| `function.BoolReturn`    | `bool`           |
+| `function.Int64Return`   | `int64`          |
+| `function.Float64Return` | `float64`        |
 | `function.ListReturn`    | `types.List`    |
 | `function.MapReturn`     | `types.Map`     |
 | `function.SetReturn`     | `types.Set`     |
@@ -164,8 +183,8 @@ resp.Error = function.ConcatFuncErrors(
 ### Unit Tests
 
 ```go
-func TestParseEmailFunction(t *testing.T) {
-    f := &parseEmailFunction{}
+func TestParseAgentSecretIdFunction(t *testing.T) {
+    f := &parseAgentSecretIdFunction{}
 
     // Test definition
     defResp := function.DefinitionResponse{}
@@ -185,10 +204,10 @@ resource.Test(t, resource.TestCase{
         {
             Config: testProviderConfig + `
 output "test" {
-  value = provider::googleworkspace::parse_email("user@example.com")
+  value = provider::livekit::parse_agent_secret_id("agent-123/MY_SECRET").agent_id
 }
 `,
-            Check: resource.TestCheckOutput("test", "user"),
+            Check: resource.TestCheckOutput("test", "agent-123"),
         },
     },
 })
@@ -197,7 +216,7 @@ output "test" {
 ## Related Framework References
 
 | File                                       | Contents               |
-| ------------------------------------------ | ---------------------- |
+| ----------------------------------------------- | ------------------------- |
 | `framework/functions/index.mdx`            | Functions overview     |
 | `framework/functions/concepts.mdx`         | Concepts and use cases |
 | `framework/functions/implementation.mdx`   | Implementation details |

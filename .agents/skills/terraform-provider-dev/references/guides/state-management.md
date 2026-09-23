@@ -6,69 +6,74 @@ Import lets practitioners bring existing resources under Terraform management wi
 
 ### Simple Import (PassthroughID)
 
-When the import ID is the same as the resource's `id` attribute:
+When the import ID is the same as the resource's `id` attribute. This is what `livekit_agent` uses, since its `id` is just the agent ID:
 
 ```go
-var _ resource.ResourceWithImportState = &fooResource{}
+var _ resource.ResourceWithImportState = &agentResource{}
 
-func (r *fooResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+func (r *agentResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
     resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+    resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("agent_id"), req.ID)...)
 }
 ```
 
-Usage: `terraform import googleworkspace_user.example "user-id-123"`
+Usage: `terraform import livekit_agent.example "agent-id-123"`
 
-### Compound Import (Split ID)
+The extra `SetAttribute` call is needed because `agent_id` is a separate computed attribute from `id`; passthrough only populates `id`.
 
-When import needs multiple values. This provider uses `importSplitId`:
+### Compound Import (Custom Parsing)
+
+When import needs multiple values. `livekit_agent_secret`'s `id` is `<agent_id>/<name>`, so its `ImportState` parses that compound ID with the `parseAgentSecretImportID` helper in `helpers.go`:
 
 ```go
-func (r *driveResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-    importSplitId(ctx, req, resp, "use_domain_admin_access", "id")
+type agentSecretImportID struct {
+    AgentID string
+    Name    string
 }
-```
 
-Usage: `terraform import googleworkspace_drive.example "true,drive-id-123"`
+func parseAgentSecretImportID(raw string) (agentSecretImportID, error) {
+    parts := strings.SplitN(raw, "/", 2)
+    if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+        return agentSecretImportID{}, fmt.Errorf("expected import ID in the format <agent_id>/<name>, got: %q", raw)
+    }
+    return agentSecretImportID{AgentID: parts[0], Name: parts[1]}, nil
+}
 
-The `importSplitId` helper splits on comma and sets each part to the corresponding attribute path.
-
-### Custom Import Logic
-
-For complex imports that need API lookups:
-
-```go
-func (r *fooResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-    // req.ID contains whatever the user passed to `terraform import`
-    parts := strings.SplitN(req.ID, "/", 2)
-    if len(parts) != 2 {
-        resp.Diagnostics.AddError("Invalid Import ID", "Expected format: parent/name")
+func (r *agentSecretResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+    parsed, err := parseAgentSecretImportID(req.ID)
+    if err != nil {
+        resp.Diagnostics.AddError("Invalid Import ID", err.Error())
         return
     }
-
-    resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("parent"), parts[0])...)
-    resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), parts[1])...)
+    resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), parsed.AgentID+"/"+parsed.Name)...)
+    resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("agent_id"), parsed.AgentID)...)
+    resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), parsed.Name)...)
 }
 ```
 
-After ImportState sets the minimal attributes, Terraform calls Read to fill in the rest.
+Usage: `terraform import livekit_agent_secret.example "agent-id-123/MY_SECRET"`
+
+Because `value_wo` is write-only, it is never populated by import; the acceptance test for this resource uses `ImportStateVerifyIgnore: []string{"value_wo_version"}` (see `references/guides/testing.md`). Practitioners must set `value_wo` and `value_wo_version` in configuration and apply once after importing, to synchronize the secret's value.
+
+After `ImportState` sets the minimal attributes, Terraform calls Read to fill in the rest.
 
 ## State Upgrade
 
-When you change a resource schema in a breaking way, existing state in `.tfstate` files won't match the new schema. State upgraders transform old state to the new format transparently.
+When you change a resource schema in a breaking way, existing state in `.tfstate` files won't match the new schema. State upgraders transform old state to the new format transparently. Neither `livekit_agent` nor `livekit_agent_secret` has needed one yet: both schemas set no `Version` (so it defaults to `0`), and neither implements `resource.ResourceWithUpgradeState`.
 
 ### When to Use
 
 - Changing a list block to SingleNestedBlock
 - Renaming attributes
 - Changing attribute types (e.g., string to int)
-- Restructuring nested objects
+- Restructuring nested objects, e.g., if `regions` ever moved from a flat `Set` to a list of nested deployment objects
 
 ### Implementation
 
 1. Increment `Version` in the schema:
 
 ```go
-func (r *fooResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+func (r *agentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
     resp.Schema = schema.Schema{
         Version: 1, // Was 0, now 1
         // ... current schema ...
@@ -79,9 +84,9 @@ func (r *fooResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 2. Implement `resource.ResourceWithUpgradeState`:
 
 ```go
-var _ resource.ResourceWithUpgradeState = &fooResource{}
+var _ resource.ResourceWithUpgradeState = &agentResource{}
 
-func (r *fooResource) UpgradeState(_ context.Context) map[int64]resource.StateUpgrader {
+func (r *agentResource) UpgradeState(_ context.Context) map[int64]resource.StateUpgrader {
     return map[int64]resource.StateUpgrader{
         0: {
             StateUpgrader: func(ctx context.Context, req resource.UpgradeStateRequest, resp *resource.UpgradeStateResponse) {
@@ -93,23 +98,11 @@ func (r *fooResource) UpgradeState(_ context.Context) map[int64]resource.StateUp
                     return
                 }
 
-                // Extract values from old format
-                var id string
-                _ = json.Unmarshal(raw["id"], &id)
+                var agentId string
+                _ = json.Unmarshal(raw["agent_id"], &agentId)
 
-                // Handle structural changes (e.g., list → single nested)
-                var name string
-                if nameRaw, ok := raw["name"]; ok {
-                    var nameList []map[string]string
-                    if err := json.Unmarshal(nameRaw, &nameList); err == nil && len(nameList) > 0 {
-                        name = nameList[0]["value"]
-                    }
-                }
-
-                // Write to current model
-                state := fooResourceModel{
-                    Id:   types.StringValue(id),
-                    Name: types.StringValue(name),
+                state := agentResourceModel{
+                    AgentId: types.StringValue(agentId),
                 }
                 resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
             },
@@ -122,9 +115,9 @@ func (r *fooResource) UpgradeState(_ context.Context) map[int64]resource.StateUp
 
 - The map key is the OLD schema version (upgrade FROM version X)
 - `req.RawState.JSON` contains the raw JSON bytes of the old state
-- Parse manually — the old state shape does not match your current model struct
+- Parse manually: the old state shape does not match your current model struct
 - After upgrade, Terraform calls Read to refresh state with current API data
-- Multiple upgraders can be chained (0→1, 1→2, etc.)
+- Multiple upgraders can be chained (0->1, 1->2, etc.)
 
 ## Private State
 
@@ -133,6 +126,8 @@ Store provider-internal data that is not visible in plan output. Useful for:
 - ETags or version tokens for optimistic concurrency
 - Internal identifiers that shouldn't be user-visible
 - Cached metadata to avoid extra API calls
+
+Not used anywhere in this provider today (there is no per-request ETag or token in the CloudAgent API surface the resources call). The pattern, if it's ever needed:
 
 ```go
 var _ resource.ResourceWithPrivateState = &fooResource{}
@@ -149,7 +144,7 @@ etag := string(etagBytes)
 
 ### Full Model Write
 
-Most common — write the entire model struct to state:
+Most common: write the entire model struct to state:
 
 ```go
 resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -157,15 +152,15 @@ resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 
 ### Individual Attribute Write
 
-Set a single attribute by path:
+Set a single attribute by path. Both `ImportState` implementations in this provider use this to populate the ID fields before Terraform's follow-up Read:
 
 ```go
-resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), "new-id")...)
+resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("agent_id"), parsed.AgentID)...)
 ```
 
 ### Removing Resource from State
 
-When Read discovers the resource no longer exists:
+When Read discovers the resource no longer exists. Both `agentResource.Read` and `agentSecretResource.Read` do this when their respective `find*` helper returns `nil, nil` (see `references/guides/resource-lifecycle.md`):
 
 ```go
 resp.State.RemoveResource(ctx)
@@ -176,7 +171,7 @@ This tells Terraform the resource was deleted externally and needs recreation.
 ## Related Framework References
 
 | File                                           | Contents                          |
-| ---------------------------------------------- | --------------------------------- |
+| --------------------------------------------------- | -------------------------------------- |
 | `framework/resources/import.mdx`               | Import state documentation        |
 | `framework/resources/state-upgrade.mdx`        | State upgrade details             |
 | `framework/resources/private-state.mdx`        | Private state storage             |
