@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/TrogonStack/terraform-provider-livekit/compare/v0.1.0...v0.1.1) (2026-11-08)
+
+
+### Bug Fixes
+
+* **ci:** give the Releaser key step its project ([#4](https://github.com/TrogonStack/terraform-provider-livekit/issues/4)) ([123c3ef](https://github.com/TrogonStack/terraform-provider-livekit/commit/123c3ef03d0c75bc398332043e63b3be32c4c336))
+
 ## 0.1.0 (2026-09-23)
 
 
